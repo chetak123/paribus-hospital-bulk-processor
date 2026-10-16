@@ -1,6 +1,6 @@
 import time
 import uuid
-from typing import List
+from typing import List, Optional, Tuple
 
 from app.csv_parser import parse_hospital_csv
 from app.hospital_client import HospitalAPIClient, HospitalAPIError
@@ -13,9 +13,63 @@ class BulkHospitalService:
 
     async def process_csv(self, contents: bytes) -> BulkResponse:
         started = time.perf_counter()
-        # Validate everything before creating any upstream records.
-        records: List[HospitalInput] = parse_hospital_csv(contents)
+        records = parse_hospital_csv(contents)
         batch_id = str(uuid.uuid4())
+
+        results, processed, creation_failed = await self._create_hospitals(batch_id, records)
+        if creation_failed:
+            cleanup_succeeded = await self._rollback(batch_id, results)
+            return self._build_response(
+                batch_id=batch_id,
+                total=len(records),
+                processed=processed,
+                failed=1,
+                started=started,
+                batch_activated=False,
+                cleanup_attempted=True,
+                cleanup_succeeded=cleanup_succeeded,
+                status="failed",
+                error="Hospital creation failed; batch was not activated.",
+                hospitals=results,
+            )
+
+        activation_error = await self._activate_batch(batch_id)
+        if activation_error:
+            cleanup_succeeded = await self._rollback(batch_id, results)
+            return self._build_response(
+                batch_id=batch_id,
+                total=len(records),
+                processed=processed,
+                failed=0,
+                started=started,
+                batch_activated=False,
+                cleanup_attempted=True,
+                cleanup_succeeded=cleanup_succeeded,
+                status="failed",
+                error=f"All hospitals were created, but batch activation failed: {activation_error}",
+                hospitals=results,
+            )
+
+        for result in results:
+            result.status = "created_and_activated"
+
+        return self._build_response(
+            batch_id=batch_id,
+            total=len(records),
+            processed=processed,
+            failed=0,
+            started=started,
+            batch_activated=True,
+            cleanup_attempted=False,
+            cleanup_succeeded=None,
+            status="completed",
+            error=None,
+            hospitals=results,
+        )
+
+    async def _create_hospitals(
+        self, batch_id: str, records: List[HospitalInput]
+    ) -> Tuple[List[RowResult], int, bool]:
         results: List[RowResult] = []
         processed = 0
 
@@ -39,76 +93,68 @@ class BulkHospitalService:
                     status="failed",
                     error=str(exc),
                 ))
-                for remaining_number, remaining in enumerate(
-                    records[row_number:], start=row_number + 1
-                ):
-                    results.append(RowResult(
-                        row=remaining_number,
-                        name=remaining.name,
-                        status="not_processed",
-                        error="Not attempted because an earlier hospital creation failed.",
-                    ))
+                self._mark_unprocessed(records[row_number:], row_number + 1, results)
+                return results, processed, True
 
-                cleanup_succeeded = await self._try_delete_batch(batch_id)
-                if cleanup_succeeded:
-                    for result in results:
-                        if result.status == "created_inactive":
-                            result.status = "rolled_back"
-                return BulkResponse(
-                    batch_id=batch_id,
-                    total_hospitals=len(records),
-                    processed_hospitals=processed,
-                    failed_hospitals=1,
-                    processing_time_seconds=round(time.perf_counter() - started, 4),
-                    batch_activated=False,
-                    cleanup_attempted=True,
-                    cleanup_succeeded=cleanup_succeeded,
-                    status="failed",
-                    error="Hospital creation failed; batch was not activated.",
-                    hospitals=results,
-                )
+        return results, processed, False
 
+    def _mark_unprocessed(
+        self, remaining: List[HospitalInput], start_row: int, results: List[RowResult]
+    ) -> None:
+        for idx, item in enumerate(remaining, start=start_row):
+            results.append(RowResult(
+                row=idx,
+                name=item.name,
+                status="not_processed",
+                error="Not attempted because an earlier hospital creation failed.",
+            ))
+
+    async def _activate_batch(self, batch_id: str) -> Optional[str]:
         try:
             await self.hospital_client.activate_batch(batch_id)
+            return None
         except HospitalAPIError as exc:
-            cleanup_succeeded = await self._try_delete_batch(batch_id)
-            if cleanup_succeeded:
-                for result in results:
+            return str(exc)
+
+    async def _rollback(self, batch_id: str, results: List[RowResult]) -> bool:
+        cleanup_succeeded = await self._try_delete_batch(batch_id)
+        if cleanup_succeeded:
+            for result in results:
+                if result.status == "created_inactive":
                     result.status = "rolled_back"
-            return BulkResponse(
-                batch_id=batch_id,
-                total_hospitals=len(records),
-                processed_hospitals=processed,
-                failed_hospitals=0,
-                processing_time_seconds=round(time.perf_counter() - started, 4),
-                batch_activated=False,
-                cleanup_attempted=True,
-                cleanup_succeeded=cleanup_succeeded,
-                status="failed",
-                error=f"All hospitals were created, but batch activation failed: {exc}",
-                hospitals=results,
-            )
-
-        for result in results:
-            result.status = "created_and_activated"
-
-        return BulkResponse(
-            batch_id=batch_id,
-            total_hospitals=len(records),
-            processed_hospitals=processed,
-            failed_hospitals=0,
-            processing_time_seconds=round(time.perf_counter() - started, 4),
-            batch_activated=True,
-            cleanup_attempted=False,
-            cleanup_succeeded=None,
-            status="completed",
-            hospitals=results,
-        )
+        return cleanup_succeeded
 
     async def _try_delete_batch(self, batch_id: str) -> bool:
         try:
             await self.hospital_client.delete_batch(batch_id)
             return True
         except HospitalAPIError:
-            # Preserve cleanup outcome in the response; don't hide the original failure.
             return False
+
+    def _build_response(
+        self,
+        batch_id: str,
+        total: int,
+        processed: int,
+        failed: int,
+        started: float,
+        batch_activated: bool,
+        cleanup_attempted: bool,
+        cleanup_succeeded: Optional[bool],
+        status: str,
+        error: Optional[str],
+        hospitals: List[RowResult],
+    ) -> BulkResponse:
+        return BulkResponse(
+            batch_id=batch_id,
+            total_hospitals=total,
+            processed_hospitals=processed,
+            failed_hospitals=failed,
+            processing_time_seconds=round(time.perf_counter() - started, 4),
+            batch_activated=batch_activated,
+            cleanup_attempted=cleanup_attempted,
+            cleanup_succeeded=cleanup_succeeded,
+            status=status,
+            error=error,
+            hospitals=hospitals,
+        )
