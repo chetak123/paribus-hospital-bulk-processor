@@ -1,14 +1,12 @@
-from typing import Any, Dict, List
+from typing import Any, Dict
 import httpx
 
 
 class HospitalAPIError(RuntimeError):
-    """An upstream Hospital Directory API request failed."""
+    pass
 
 
 class HospitalAPIClient:
-    """Small adapter around the existing Hospital Directory API."""
-
     def __init__(self, base_url: str, timeout_seconds: float = 10.0):
         self.base_url = base_url.rstrip("/")
         self.timeout_seconds = timeout_seconds
@@ -23,6 +21,9 @@ class HospitalAPIClient:
         except (httpx.HTTPError, ValueError) as exc:
             raise HospitalAPIError(f"{method} {path} failed: {exc}") from exc
 
+        return self._parse_response(response, method, path)
+
+    def _parse_response(self, response: httpx.Response, method: str, path: str) -> Any:
         if response.status_code == 204 or not response.content:
             return None
 

@@ -160,7 +160,7 @@ See [docs/api.md](docs/api.md) for the complete request/response contract and ex
 
 ```bash
 # Run unit test suite
-pytest
+python -m pytest -q
 
 # Verbose output
 pytest -v
